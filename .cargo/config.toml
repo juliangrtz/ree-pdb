@@ -1,0 +1,3 @@
+[build]
+# If you already have the "-L" flag from the previous step, just add the "-C" flags to the same array!
+rustflags = ["-C", "target-feature=+crt-static"]
