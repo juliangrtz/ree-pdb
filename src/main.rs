@@ -3,7 +3,10 @@ use std::{collections::HashMap, fs, path::PathBuf, time::Instant};
 use anyhow::{Result, bail};
 use clap::Parser;
 use object::{Object, read::pe::PeFile64};
-use pdb_wrapper::{PDB, PDBType, StructField, pdb_meta::SimpleTypeKind};
+use pdb_wrapper::{
+    PDB, PDBFunction, PDBType, StructField,
+    pdb_meta::{CallingConvention, SimpleTypeKind},
+};
 use regex::Regex;
 use serde::{Deserialize, Deserializer};
 
@@ -99,11 +102,12 @@ impl REType {
     pub fn get_struct_fields(&self) -> Result<Vec<StructField>> {
         let mut struct_fields = vec![];
         for (f_name, field) in &self.fields {
-            if let Ok(ty) = field.to_pdb_type() {
+            if let Ok(ty) = to_pdb_type(&field.r#type) {
                 let sf = StructField {
                     ty,
                     name: f_name.clone(),
                     offset: field.offset_from_base as u64,
+                    is_static: field.flags.contains("Static"),
                 };
                 struct_fields.push(sf);
             }
@@ -126,31 +130,32 @@ pub struct REField {
     #[serde(deserialize_with = "parse_address_u32")]
     offset_from_fieldptr: u32,
     r#type: String,
+    #[serde(default)]
+    flags: String,
 }
 
-impl REField {
-    pub fn to_pdb_type(&self) -> Result<PDBType> {
-        let t = match self.r#type.as_str() {
-            "System.Boolean" => PDBType::SimpleType(SimpleTypeKind::Boolean8),
-            "System.SByte" => PDBType::SimpleType(SimpleTypeKind::SByte),
-            "System.Int16" => PDBType::SimpleType(SimpleTypeKind::Int16),
-            "System.Int32" => PDBType::SimpleType(SimpleTypeKind::Int32),
-            "System.Int64" => PDBType::SimpleType(SimpleTypeKind::Int64),
-            "System.Byte" => PDBType::SimpleType(SimpleTypeKind::Byte),
-            "System.UInt16" => PDBType::SimpleType(SimpleTypeKind::UInt16),
-            "System.UInt32" => PDBType::SimpleType(SimpleTypeKind::UInt32),
-            "System.UInt64" => PDBType::SimpleType(SimpleTypeKind::UInt64),
-            "System.Single" => PDBType::SimpleType(SimpleTypeKind::Float32),
-            "System.Double" => PDBType::SimpleType(SimpleTypeKind::Float64),
-            "System.Char" => PDBType::SimpleType(SimpleTypeKind::WideCharacter),
-            "System.Guid" => {
-                PDBType::ConstantArray(Box::new(PDBType::SimpleType(SimpleTypeKind::Byte)), 8)
-            }
-            _ => PDBType::Pointer(Box::new(PDBType::Struct(self.r#type.clone()))),
-            //_ => bail!("Unmatched type"),
-        };
-        Ok(t)
-    }
+pub fn to_pdb_type(name: &str) -> Result<PDBType> {
+    let t = match name {
+        "System.Boolean" => PDBType::SimpleType(SimpleTypeKind::Boolean8),
+        "System.SByte" => PDBType::SimpleType(SimpleTypeKind::SByte),
+        "System.Int16" => PDBType::SimpleType(SimpleTypeKind::Int16),
+        "System.Int32" => PDBType::SimpleType(SimpleTypeKind::Int32),
+        "System.Int64" => PDBType::SimpleType(SimpleTypeKind::Int64),
+        "System.Byte" => PDBType::SimpleType(SimpleTypeKind::Byte),
+        "System.UInt16" => PDBType::SimpleType(SimpleTypeKind::UInt16),
+        "System.UInt32" => PDBType::SimpleType(SimpleTypeKind::UInt32),
+        "System.UInt64" => PDBType::SimpleType(SimpleTypeKind::UInt64),
+        "System.Single" => PDBType::SimpleType(SimpleTypeKind::Float32),
+        "System.Double" => PDBType::SimpleType(SimpleTypeKind::Float64),
+        "System.Char" => PDBType::SimpleType(SimpleTypeKind::WideCharacter),
+        "System.Void" => PDBType::SimpleType(SimpleTypeKind::Void),
+        "System.Guid" => {
+            PDBType::ConstantArray(Box::new(PDBType::SimpleType(SimpleTypeKind::Byte)), 8)
+        }
+        _ => PDBType::Pointer(Box::new(PDBType::Struct(name.to_string()))),
+        //_ => bail!("Unmatched type"),
+    };
+    Ok(t)
 }
 
 #[allow(unused)]
@@ -162,7 +167,8 @@ pub struct REMethod {
     #[serde(deserialize_with = "parse_address_u64")]
     function: u64,
     id: u32,
-    impl_flags: Option<String>,
+    #[serde(default)]
+    impl_flags: String,
     invoke_id: u32,
     params: Option<Vec<REParam>>,
     returns: Option<REParam>,
@@ -170,6 +176,9 @@ pub struct REMethod {
 }
 
 impl REMethod {
+    pub fn symbol_name(&self, r#type: &REType) -> String {
+        format!("{}::{}", r#type.name, self.name)
+    }
     pub fn signature(&self, r#type: &REType) -> String {
         let params = self
             .params
@@ -190,8 +199,45 @@ impl REMethod {
                 params
             })
             .unwrap_or("".to_string());
-        let signature = format!("{}::{}({})", r#type.name, self.name, params);
+        let signature = format!("{}({})", self.symbol_name(r#type), params);
         signature
+    }
+
+    pub fn get_pdb_function(&self, class: Option<&str>) -> PDBFunction {
+        let ret_type = self
+            .returns
+            .as_ref()
+            .and_then(|f| to_pdb_type(&f.r#type).ok())
+            // this never really happens
+            .unwrap_or_else(|| PDBType::SimpleType(SimpleTypeKind::Void));
+
+        // vmctx passed in here
+        let mut param_types = vec![PDBType::Pointer(Box::new(PDBType::SimpleType(
+            SimpleTypeKind::Void,
+        )))];
+
+        if self.impl_flags.contains("HasThis") {
+            if let Some(class_name) = class {
+                param_types.push(PDBType::Pointer(Box::new(PDBType::Struct(
+                    class_name.to_string(),
+                ))));
+            }
+        }
+
+        if let Some(params) = &self.params {
+            for param in params {
+                let pdb_type = to_pdb_type(&param.r#type)
+                    .ok()
+                    .unwrap_or_else(|| PDBType::SimpleType(SimpleTypeKind::Void));
+                param_types.push(pdb_type);
+            }
+        }
+
+        let cconv = CallingConvention::NearFast;
+
+        //let class_type = class.map(|x| PDBType::Struct(x.to_string()));
+        //PDBFunction::new(ret_type, &param_types, class_type, cconv)
+        PDBFunction::new_ex(ret_type, param_types, None, cconv)
     }
 }
 
@@ -301,6 +347,7 @@ fn add_types(pdb: &mut PDB, il2cpp: &Il2Cpp, addr_offset: u64, verbose: bool) ->
         }
         let struct_fields = t.get_struct_fields()?;
         pdb.insert_struct(&name, &struct_fields, t.size as u64)?;
+
         for (_f_name, function) in &t.methods {
             if function.function != 0 {
                 let signature = function.signature(t);
@@ -308,7 +355,27 @@ fn add_types(pdb: &mut PDB, il2cpp: &Il2Cpp, addr_offset: u64, verbose: bool) ->
                     println!("\tAdding function {}@{:x}", signature, function.function);
                 }
                 let offset_addr = (function.function - addr_offset) as u32;
-                pdb.insert_function(1, offset_addr, &signature, None)?;
+                let pdb_func = function.get_pdb_function(Some(&name));
+                let func_type = PDBType::Function(pdb_func);
+                let sym_name = function.symbol_name(t);
+                let mut param_names = vec![];
+                param_names.push("vmctx");
+                if function.impl_flags.contains("HasThis") {
+                    param_names.push("this");
+                }
+
+                if let Some(params) = &function.params {
+                    for param in params {
+                        if param.name.is_empty() {
+                            param_names.push("unk_param");
+                        } else {
+                            param_names.push(param.name.as_str());
+                        }
+                    }
+                }
+                //pdb.insert_function(1, offset_addr, &sym_name, None)?;
+                pdb.insert_function(1, offset_addr, &sym_name, Some(&func_type), &param_names)?;
+                //pdb.insert_function(1, offset_addr, &function.name, Some(&func_type))?;
             }
         }
     }
