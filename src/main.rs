@@ -70,6 +70,39 @@ struct PdbArgs {
     address: u64,
 }
 
+// idk if this should be part of the REType, or something else
+// lowkirkenuenly i should rewrite this whole program
+pub fn get_pdb_type(type_name: &str, il2cpp: &Il2Cpp) -> PDBType {
+    match type_name {
+        "System.Boolean" => PDBType::SimpleType(SimpleTypeKind::Boolean8),
+        "System.SByte" => PDBType::SimpleType(SimpleTypeKind::SByte),
+        "System.Int16" => PDBType::SimpleType(SimpleTypeKind::Int16),
+        "System.Int32" => PDBType::SimpleType(SimpleTypeKind::Int32),
+        "System.Int64" => PDBType::SimpleType(SimpleTypeKind::Int64),
+        "System.Byte" => PDBType::SimpleType(SimpleTypeKind::Byte),
+        "System.UInt16" => PDBType::SimpleType(SimpleTypeKind::UInt16),
+        "System.UInt32" => PDBType::SimpleType(SimpleTypeKind::UInt32),
+        "System.UInt64" => PDBType::SimpleType(SimpleTypeKind::UInt64),
+        "System.Single" => PDBType::SimpleType(SimpleTypeKind::Float32),
+        "System.Double" => PDBType::SimpleType(SimpleTypeKind::Float64),
+        "System.Char" => PDBType::SimpleType(SimpleTypeKind::WideCharacter),
+        "System.Void" => PDBType::SimpleType(SimpleTypeKind::Void),
+        "System.Guid" => {
+            PDBType::ConstantArray(Box::new(PDBType::SimpleType(SimpleTypeKind::Byte)), 16)
+        }
+        _ => {
+            if let Some(t) = il2cpp.get(type_name) {
+                if t.parent == "System.ValueType" || t.parent == "System.Enum" {
+                    return PDBType::Struct(type_name.to_string());
+                }
+            }
+            PDBType::Pointer(Box::new(PDBType::Struct(type_name.to_string())))
+        }
+    }
+}
+
+// i really should impl Deserialize myself to get better descriptions of the type,
+// or just convert to PDBType, etc before adding everything
 #[allow(unused)]
 #[derive(Debug, Deserialize)]
 pub struct REType {
@@ -96,24 +129,63 @@ pub struct REType {
     #[serde(deserialize_with = "parse_address_u32")]
     #[serde(default)]
     size: u32,
+    #[serde(default)]
+    parent: String,
 }
 
 impl REType {
-    pub fn get_struct_fields(&self) -> Result<Vec<StructField>> {
+    pub fn get_struct_fields(&self, il2cpp: &Il2Cpp) -> Result<Vec<StructField>> {
         let mut struct_fields = vec![];
+        let not_enum_or_value =
+            self.parent.as_str() != "System.Enum" && self.parent.as_str() != "System.ValueType";
         for (f_name, field) in &self.fields {
-            if let Ok(ty) = to_pdb_type(&field.r#type) {
-                let sf = StructField {
-                    ty,
-                    name: f_name.clone(),
-                    offset: field.offset_from_base as u64,
-                    is_static: field.flags.contains("Static"),
-                };
-                struct_fields.push(sf);
-            }
+            let ty = get_pdb_type(&field.r#type, il2cpp);
+            let sf = StructField {
+                ty,
+                name: f_name.clone(),
+                offset: if not_enum_or_value {
+                    field.offset_from_base as u64
+                } else {
+                    field.offset_from_fieldptr as u64
+                },
+                is_static: field.flags.contains("Static"),
+            };
+            struct_fields.push(sf);
         }
         struct_fields.sort_by_key(|f| f.offset);
         Ok(struct_fields)
+    }
+
+    pub fn to_pdb_type(&self) -> Result<PDBType> {
+        let is_enum = self.parent == "System.Enum";
+        let is_value_type = self.parent == "System.ValueType";
+        //let is_array = self.parent == "System.Array";
+        let t = match self.name.as_str() {
+            "System.Boolean" => PDBType::SimpleType(SimpleTypeKind::Boolean8),
+            "System.SByte" => PDBType::SimpleType(SimpleTypeKind::SByte),
+            "System.Int16" => PDBType::SimpleType(SimpleTypeKind::Int16),
+            "System.Int32" => PDBType::SimpleType(SimpleTypeKind::Int32),
+            "System.Int64" => PDBType::SimpleType(SimpleTypeKind::Int64),
+            "System.Byte" => PDBType::SimpleType(SimpleTypeKind::Byte),
+            "System.UInt16" => PDBType::SimpleType(SimpleTypeKind::UInt16),
+            "System.UInt32" => PDBType::SimpleType(SimpleTypeKind::UInt32),
+            "System.UInt64" => PDBType::SimpleType(SimpleTypeKind::UInt64),
+            "System.Single" => PDBType::SimpleType(SimpleTypeKind::Float32),
+            "System.Double" => PDBType::SimpleType(SimpleTypeKind::Float64),
+            "System.Char" => PDBType::SimpleType(SimpleTypeKind::WideCharacter),
+            "System.Void" => PDBType::SimpleType(SimpleTypeKind::Void),
+            "System.Guid" => {
+                PDBType::ConstantArray(Box::new(PDBType::SimpleType(SimpleTypeKind::Byte)), 16)
+            }
+            _ => {
+                if is_enum || is_value_type {
+                    PDBType::Struct(self.name.to_string())
+                } else {
+                    PDBType::Pointer(Box::new(PDBType::Struct(self.name.to_string())))
+                }
+            } //_ => bail!("Unmatched type"),
+        };
+        Ok(t)
     }
 }
 
@@ -134,7 +206,9 @@ pub struct REField {
     flags: String,
 }
 
-pub fn to_pdb_type(name: &str) -> Result<PDBType> {
+pub fn to_pdb_type(name: &str, parent: &str) -> Result<PDBType> {
+    let is_enum = parent == "System.Enum";
+    let is_value_type = parent == "System.ValueType";
     let t = match name {
         "System.Boolean" => PDBType::SimpleType(SimpleTypeKind::Boolean8),
         "System.SByte" => PDBType::SimpleType(SimpleTypeKind::SByte),
@@ -152,8 +226,10 @@ pub fn to_pdb_type(name: &str) -> Result<PDBType> {
         "System.Guid" => {
             PDBType::ConstantArray(Box::new(PDBType::SimpleType(SimpleTypeKind::Byte)), 8)
         }
-        _ => PDBType::Pointer(Box::new(PDBType::Struct(name.to_string()))),
-        //_ => bail!("Unmatched type"),
+        _ => {
+            if is_enum {}
+            PDBType::Pointer(Box::new(PDBType::Struct(name.to_string())))
+        } //_ => bail!("Unmatched type"),
     };
     Ok(t)
 }
@@ -203,11 +279,12 @@ impl REMethod {
         signature
     }
 
-    pub fn get_pdb_function(&self, class: Option<&str>) -> PDBFunction {
+    pub fn get_pdb_function(&self, class: Option<&str>, il2cpp: &Il2Cpp) -> PDBFunction {
         let ret_type = self
             .returns
             .as_ref()
-            .and_then(|f| to_pdb_type(&f.r#type).ok())
+            .and_then(|f| il2cpp.get(&f.r#type))
+            .and_then(|t| t.to_pdb_type().ok())
             // this never really happens
             .unwrap_or_else(|| PDBType::SimpleType(SimpleTypeKind::Void));
 
@@ -226,10 +303,12 @@ impl REMethod {
 
         if let Some(params) = &self.params {
             for param in params {
-                let pdb_type = to_pdb_type(&param.r#type)
-                    .ok()
+                param_types.push(get_pdb_type(&param.r#type, il2cpp));
+                /*let pdb_type = il2cpp
+                    .get(&param.r#type)
+                    .and_then(|t| t.to_pdb_type().ok())
                     .unwrap_or_else(|| PDBType::SimpleType(SimpleTypeKind::Void));
-                param_types.push(pdb_type);
+                param_types.push(pdb_type);*/
             }
         }
 
@@ -345,8 +424,71 @@ fn add_types(pdb: &mut PDB, il2cpp: &Il2Cpp, addr_offset: u64, verbose: bool) ->
         if verbose {
             println!("Adding Type {name}");
         }
-        let struct_fields = t.get_struct_fields()?;
-        pdb.insert_struct(&name, &struct_fields, t.size as u64)?;
+
+        let mut virtual_methods: Vec<&REMethod> = t
+            .methods
+            .values()
+            .filter(|m| m.vtable_index.is_some())
+            .collect();
+
+        //let is_enum = t.parent.as_str() == "System.Enum";
+        let is_value_type = t.parent.as_str() == "System.ValueType";
+
+        if t.parent == "System.Enum" {
+            //println!("Adding enum {}", t.name);
+            if let Some(val_field) = t.fields.get("value__") {
+                let underlying_type = il2cpp.get(&val_field.r#type);
+                if let Some(underlying_ty) = underlying_type {
+                    if let Ok(pdb_type) = underlying_ty.to_pdb_type() {
+                        let fields = vec![StructField {
+                            ty: pdb_type,
+                            name: "value__".to_string(),
+                            offset: 0,
+                            is_static: false,
+                        }];
+                        pdb.insert_struct(&name, &fields, underlying_ty.size as u64)?;
+                    }
+                }
+            }
+        }
+        // value types shouldnt have vtables in their structs
+        // TODO: maybe i should add a boxed type with a vtable
+        else if !virtual_methods.is_empty() && !is_value_type {
+            // safe to unwrap here since the above filters by is_some
+            virtual_methods.sort_by_key(|m| m.vtable_index.unwrap());
+            let vtable_name = format!("{}__vtable", name);
+            let mut vtable_fields = vec![];
+            let mut max_vtable_size = 0;
+            for method in &virtual_methods {
+                let v_idx = method.vtable_index.unwrap() as u64;
+                let pdb_func = method.get_pdb_function(Some(&name), il2cpp);
+                let func_ptr_type = PDBType::Pointer(Box::new(PDBType::Function(pdb_func)));
+                let offset = v_idx * 8;
+                vtable_fields.push(StructField {
+                    ty: func_ptr_type,
+                    name: method.name.clone(),
+                    offset,
+                    is_static: false,
+                });
+                max_vtable_size = max_vtable_size.max(offset + 8);
+            }
+            //println!("Adding vtable {vtable_name}");
+            pdb.insert_struct(&vtable_name, &vtable_fields, max_vtable_size)?;
+
+            let mut main_struct_fields = t.get_struct_fields(il2cpp)?;
+            main_struct_fields.push(StructField {
+                ty: PDBType::Pointer(Box::new(PDBType::Struct(vtable_name))),
+                name: "__vftable".to_string(),
+                offset: 0x0,
+                is_static: false,
+            });
+            main_struct_fields.sort_by_key(|f| f.offset);
+            pdb.insert_struct(&name, &main_struct_fields, t.size as u64)?;
+        } else {
+            //println!("Adding normal struct {}", t.name);
+            let struct_fields = t.get_struct_fields(il2cpp)?;
+            pdb.insert_struct(&name, &struct_fields, t.size as u64)?;
+        }
 
         for (_f_name, function) in &t.methods {
             if function.function != 0 {
@@ -355,7 +497,7 @@ fn add_types(pdb: &mut PDB, il2cpp: &Il2Cpp, addr_offset: u64, verbose: bool) ->
                     println!("\tAdding function {}@{:x}", signature, function.function);
                 }
                 let offset_addr = (function.function - addr_offset) as u32;
-                let pdb_func = function.get_pdb_function(Some(&name));
+                let pdb_func = function.get_pdb_function(Some(&name), il2cpp);
                 let func_type = PDBType::Function(pdb_func);
                 let sym_name = function.symbol_name(t);
                 let mut param_names = vec![];
@@ -367,7 +509,8 @@ fn add_types(pdb: &mut PDB, il2cpp: &Il2Cpp, addr_offset: u64, verbose: bool) ->
                 if let Some(params) = &function.params {
                     for param in params {
                         if param.name.is_empty() {
-                            param_names.push("unk_param");
+                            // hopefully the dissassembler renames blank names itself pls and ty
+                            param_names.push("");
                         } else {
                             param_names.push(param.name.as_str());
                         }
